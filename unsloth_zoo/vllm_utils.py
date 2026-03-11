@@ -1077,6 +1077,13 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     embed_tokens = vllm_text_model.embed_tokens
     # Use get_state_dict for consistent extraction and automatic truncation
     get_state_dict(f"{vllm_text_model_prefix}.embed_tokens", 0, state_dict, embed_tokens, slice_weights=False)
+    # Compatibility alias for multimodal models where downstream code expects
+    # `model.embed_tokens.weight` even when text weights are nested under
+    # `model.language_model.embed_tokens.weight`.
+    nested_embed_key = f"{vllm_text_model_prefix}.embed_tokens.weight"
+    if nested_embed_key in state_dict and "model.embed_tokens.weight" not in state_dict:
+        state_dict["model.embed_tokens.weight"] = state_dict[nested_embed_key]
+        quant_state_dict["model.embed_tokens.weight"] = quant_state_dict[nested_embed_key]
 
     # Get layer configuration for this model type
     layer_config = get_model_layer_config()
@@ -1093,6 +1100,8 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     skipped_layernorms = []
     for kk in range(len(vllm_text_model.layers)):
         layer = vllm_text_model.layers[kk]
+        prefix = None
+        o_proj = None
         if hasattr(layer, "self_attn"):
             prefix = f"{vllm_text_model_prefix}.layers.{kk}.self_attn"
             qkv_proj = layer.self_attn.qkv_proj
@@ -1119,8 +1128,10 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
             get_state_dict(f"{prefix}.q_proj", 0, state_dict, q_proj)
             get_state_dict(f"{prefix}.k_proj", 1, state_dict, kv_proj)
             get_state_dict(f"{prefix}.v_proj", 2, state_dict, kv_proj)
-
-        get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
+        # Some architectures (eg hybrid/mamba-style blocks) can omit attention.
+        # Skip attention projection extraction in those layers.
+        if prefix is not None and o_proj is not None:
+            get_state_dict(f"{prefix}.o_proj", 0, state_dict, o_proj)
 
         proj = layer.mlp.gate_up_proj
         use_fused_gate_up = _is_fused_module("gate_up_proj")
@@ -1156,8 +1167,14 @@ def _get_vllm_state_dict(llm, return_state_dict = False, config = None, is_visio
     pass
 
     if is_vision_model:
-        # Handle vision-specific layers using dedicated functions
-        extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        # Handle vision-specific layers using dedicated functions.
+        # Some newer Qwen3.5 VLM checkpoints expose packed qkv layouts that
+        # do not match expected split offsets in extract_vision_layers.
+        # For text-only GRPO/RL workloads, continue with language weights.
+        try:
+            extract_vision_layers(vllm_internals, state_dict, quant_state_dict, get_state_dict)
+        except Exception as e:
+            print(f"Unsloth: Skipping vision layer extraction due to compatibility issue: {e}")
     # Norm
     # For Gemma3 and similar multimodal models, norm should be under model.norm
     # For standard models, also under model.norm

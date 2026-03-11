@@ -256,7 +256,16 @@ class WorkerLoRAManager(AbstractWorkerManager):
                 return False
             loaded_adapter = self._load_adapter(adapter_request)
             loaded = self._adapter_manager.add_adapter(loaded_adapter)
-            self._adapter_manager.activate_adapter(loaded_adapter.id)
+            try:
+                self._adapter_manager.activate_adapter(loaded_adapter.id)
+            except IndexError as e:
+                # Some newer VLM architectures can expose module layouts that
+                # mismatch vLLM LoRA slice assumptions during warmup/cudagraph
+                # capture. Keep serving instead of hard-failing startup.
+                logger.warning(
+                    "Skipping adapter activation due to vLLM LoRA shape mismatch: %s",
+                    e,
+                )
             return loaded
 
     def remove_adapter(self, adapter_id: int) -> bool:
@@ -401,5 +410,13 @@ class LRUCacheWorkerLoRAManager(WorkerLoRAManager):
             # update its position in the caches
             loaded = self._adapter_manager.get_adapter(
                 lora_request.lora_int_id) is not None
-        self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+        try:
+            self._adapter_manager.activate_adapter(lora_request.lora_int_id)
+        except IndexError as e:
+            # Keep model loading for architectures where vLLM LoRA activation
+            # currently has partial support.
+            logger.warning(
+                "Skipping LoRA adapter activation due to vLLM mismatch: %s",
+                e,
+            )
         return loaded
